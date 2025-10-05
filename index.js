@@ -18,6 +18,12 @@ var normalize = !win32 ? echo : function (name) {
   return name.replace(/\\/g, '/').replace(/[:?<>|]/g, '_')
 }
 
+var inCwd = function (filepath, cwd) {
+  var resolved = path.resolve(filepath)
+  var cwdResolved = path.resolve(cwd)
+  return resolved === cwdResolved || resolved.startsWith(cwdResolved + path.sep)
+}
+
 var statAll = function (fs, stat, cwd, ignore, entries, sort) {
   var queue = entries || ['.']
 
@@ -261,7 +267,8 @@ exports.extract = function (cwd, opts) {
       if (win32) return next() // skip symlinks on win for now before it can be tested
       xfs.unlink(name, function () {
         var dst = path.resolve(path.dirname(name), header.linkname)
-        if (!dst.startsWith(path.resolve(cwd))) return next(new Error(name + ' is not a valid symlink'))
+        var resolvedCwd = path.resolve(cwd)
+        if (!(dst === resolvedCwd || dst.startsWith(resolvedCwd + path.sep))) return next(new Error(name + ' is not a valid symlink'))
 
         xfs.symlink(header.linkname, name, stat)
       })
@@ -272,13 +279,17 @@ exports.extract = function (cwd, opts) {
       xfs.unlink(name, function () {
         var srcpath = path.join(cwd, path.join('/', header.linkname))
 
-        xfs.link(srcpath, name, function (err) {
-          if (err && err.code === 'EPERM' && opts.hardlinkAsFilesFallback) {
-            stream = xfs.createReadStream(srcpath)
-            return onfile()
-          }
+        fs.realpath(srcpath, function (err, dst) {
+          if (err || !inCwd(dst, cwd)) return next(new Error(name + ' is not a valid hardlink'))
 
-          stat(err)
+          xfs.link(dst, name, function (err) {
+            if (err && err.code === 'EPERM' && opts.hardlinkAsFilesFallback) {
+              stream = xfs.createReadStream(dst)
+              return onfile()
+            }
+
+            stat(err)
+          })
         })
       })
     }
@@ -297,18 +308,21 @@ exports.extract = function (cwd, opts) {
       })
     }
 
-    if (header.type === 'directory') {
-      stack.push([name, header.mtime])
-      return mkdirfix(name, {
-        fs: xfs, own: own, uid: header.uid, gid: header.gid
-      }, stat)
-    }
-
-    var dir = path.dirname(name)
+    var dir = path.join(name, '.') === path.join(cwd, '.') ? cwd : path.dirname(name)
 
     validate(xfs, dir, path.join(cwd, '.'), function (err, valid) {
       if (err) return next(err)
       if (!valid) return next(new Error(dir + ' is not a valid path'))
+      if (header.type === 'directory') {
+        stack.push([name, header.mtime])
+        return mkdirfix(name, {
+          fs: xfs,
+          own: own,
+          uid: header.uid,
+          gid: header.gid,
+          mode: header.mode
+        }, stat)
+      }
 
       mkdirfix(dir, {
         fs: xfs, own: own, uid: header.uid, gid: header.gid
@@ -337,7 +351,7 @@ exports.extract = function (cwd, opts) {
 function validate (fs, name, root, cb) {
   if (name === root) return cb(null, true)
   fs.lstat(name, function (err, st) {
-    if (err && err.code !== 'ENOENT') return cb(err)
+    if (err && err.code !== 'ENOENT' && err.code !== 'EPERM') return cb(err)
     if (err || st.isDirectory()) return validate(fs, path.join(name, '..'), root, cb)
     cb(null, false)
   })
